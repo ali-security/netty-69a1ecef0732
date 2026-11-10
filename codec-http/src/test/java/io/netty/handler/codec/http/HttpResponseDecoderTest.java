@@ -1236,13 +1236,70 @@ public class HttpResponseDecoderTest {
         EmbeddedChannel channel = new EmbeddedChannel(new HttpResponseDecoder());
         String requestStr = "HTTP/1.1 200 OK\r\n" +
                 "Transfer-Encoding : chunked\r\n" +
-                "Host: netty.io\n\r\n";
+                "Host: netty.io\r\n\r\n";
 
         assertTrue(channel.writeInbound(Unpooled.copiedBuffer(requestStr, CharsetUtil.US_ASCII)));
         HttpResponse response = channel.readInbound();
         assertFalse(response.decoderResult().isFailure());
         assertEquals(HttpHeaderValues.CHUNKED.toString(), response.headers().get(HttpHeaderNames.TRANSFER_ENCODING));
         assertEquals("netty.io", response.headers().get(HttpHeaderNames.HOST));
+        assertFalse(channel.finish());
+    }
+
+    @Test
+    void mustRejectImproperlyTerminatedChunkExtensions() throws Exception {
+        // See full explanation: https://w4ke.info/2025/06/18/funky-chunks.html
+        String requestStr = "HTTP/1.1 200 OK\r\n" +
+                "Transfer-Encoding: chunked\r\n" +
+                "\r\n" +
+                "2;\n" + // Chunk size followed by illegal single newline (not preceded by carraige return)
+                "xx\r\n" +
+                "1D\r\n" +
+                "0\r\n\r\n" +
+                "HTTP/1.1 200 OK\r\n" +
+                "Transfer-Encoding: chunked\r\n\r\n" +
+                "0\r\n\r\n";
+        EmbeddedChannel channel = new EmbeddedChannel(new HttpResponseDecoder());
+        assertTrue(channel.writeInbound(Unpooled.copiedBuffer(requestStr, CharsetUtil.US_ASCII)));
+        HttpResponse response = channel.readInbound();
+        assertFalse(response.decoderResult().isFailure()); // We parse the headers just fine.
+        assertTrue(response.headers().names().contains("Transfer-Encoding"));
+        assertTrue(response.headers().contains("Transfer-Encoding", "chunked", false));
+        HttpContent content = channel.readInbound();
+        DecoderResult decoderResult = content.decoderResult();
+        assertTrue(decoderResult.isFailure()); // But parsing the chunk must fail.
+        assertThat(decoderResult.cause(), instanceOf(InvalidChunkExtensionException.class));
+        content.release();
+        assertFalse(channel.finish());
+    }
+
+    @Test
+    void mustRejectImproperlyTerminatedChunkBodies() throws Exception {
+        // See full explanation: https://w4ke.info/2025/06/18/funky-chunks.html
+        String requestStr = "HTTP/1.1 200 OK\r\n" +
+                "Transfer-Encoding: chunked\r\n\r\n" +
+                "5\r\n" +
+                "AAAAXX" + // Chunk body contains extra (XX) bytes, and no CRLF terminator.
+                "1D\r\n" +
+                "0\r\n" +
+                "HTTP/1.1 200 OK\r\n" +
+                "Transfer-Encoding: chunked\r\n\r\n" +
+                "0\r\n\r\n";
+        EmbeddedChannel channel = new EmbeddedChannel(new HttpResponseDecoder());
+        assertTrue(channel.writeInbound(Unpooled.copiedBuffer(requestStr, CharsetUtil.US_ASCII)));
+        HttpResponse response = channel.readInbound();
+        assertFalse(response.decoderResult().isFailure()); // We parse the headers just fine.
+        assertTrue(response.headers().names().contains("Transfer-Encoding"));
+        assertTrue(response.headers().contains("Transfer-Encoding", "chunked", false));
+        HttpContent content = channel.readInbound();
+        assertFalse(content.decoderResult().isFailure()); // We parse the content promised by the chunk length.
+        content.release();
+
+        content = channel.readInbound();
+        DecoderResult decoderResult = content.decoderResult();
+        assertTrue(decoderResult.isFailure()); // But then parsing the chunk delimiter must fail.
+        assertThat(decoderResult.cause(), instanceOf(InvalidChunkTerminationException.class));
+        content.release();
         assertFalse(channel.finish());
     }
 
@@ -1339,7 +1396,7 @@ public class HttpResponseDecoderTest {
         testHeaderNameEndsWithControlChar(0x0c);
     }
 
-    private void testHeaderNameEndsWithControlChar(int controlChar) {
+    private static void testHeaderNameEndsWithControlChar(int controlChar) {
         ByteBuf responseBuffer = Unpooled.buffer();
         responseBuffer.writeCharSequence("HTTP/1.1 200 OK\r\n" +
                 "Host: netty.io\r\n", CharsetUtil.US_ASCII);
@@ -1354,7 +1411,7 @@ public class HttpResponseDecoderTest {
             "HTTP/1.11", "HTTP/11.1", "HTTP/A.1", "HTTP/1.B"})
     public void testInvalidVersion(String version) {
         testInvalidHeaders0(Unpooled.copiedBuffer(
-                version + " 200 OK\n\r\nHost: whatever\r\n\r\n", CharsetUtil.US_ASCII));
+                version + " 200 OK\r\nHost: whatever\r\n\r\n", CharsetUtil.US_ASCII));
     }
 
     private static void testInvalidHeaders0(ByteBuf responseBuffer) {
