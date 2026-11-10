@@ -40,6 +40,7 @@ import io.netty.handler.codec.compression.ZstdDecoder;
 public class HttpContentDecompressor extends HttpContentDecoder {
 
     private final boolean strict;
+    private final int maxAllocation;
 
     /**
      * Create a new {@link HttpContentDecompressor} in non-strict mode.
@@ -55,7 +56,33 @@ public class HttpContentDecompressor extends HttpContentDecoder {
      *                  more lenient fashion.
      */
     public HttpContentDecompressor(boolean strict) {
+        this(strict, 0);
+    }
+
+    /**
+     * Create a new {@link HttpContentDecompressor} in non-strict mode.
+     *
+     * @param maxAllocation Maximum size of the decompression buffer. Must be &gt;= 0.
+     *                      If zero, maximum size is not limited.
+     */
+    public HttpContentDecompressor(int maxAllocation) {
+        this(false, maxAllocation);
+    }
+
+    /**
+     * Create a new {@link HttpContentDecompressor}.
+     *
+     * @param strict    if {@code true} use strict handling of deflate if used, otherwise handle it in a
+     *                  more lenient fashion.
+     * @param maxAllocation Maximum size of the decompression buffer. Must be &gt;= 0.
+     *                      If zero, maximum size is not limited.
+     */
+    public HttpContentDecompressor(boolean strict, int maxAllocation) {
+        if (maxAllocation < 0) {
+            throw new IllegalArgumentException("maxAllocation: " + maxAllocation + " (expected >= 0)");
+        }
         this.strict = strict;
+        this.maxAllocation = maxAllocation;
     }
 
     @Override
@@ -72,19 +99,25 @@ public class HttpContentDecompressor extends HttpContentDecoder {
             return new EmbeddedChannel(ctx.channel().id(), ctx.channel().metadata().hasDisconnect(),
                     ctx.channel().config(), ZlibCodecFactory.newZlibDecoder(wrapper));
         }
+        // Brotli/Snappy/Zstd decoders do not enforce the configured maxAllocation natively, so a
+        // decompression bomb can bypass the limit (CVE-2026-42587). Append a guard that caps the
+        // cumulative decompressed output, mirroring the reject-on-overflow behavior of the zlib path.
         if (Brotli.isAvailable() && BR.contentEqualsIgnoreCase(contentEncoding)) {
             return new EmbeddedChannel(ctx.channel().id(), ctx.channel().metadata().hasDisconnect(),
-              ctx.channel().config(), new BrotliDecoder());
+              ctx.channel().config(), new BrotliDecoder(),
+              new HttpDecompressionAllocationGuard(maxAllocation));
         }
 
         if (SNAPPY.contentEqualsIgnoreCase(contentEncoding)) {
             return new EmbeddedChannel(ctx.channel().id(), ctx.channel().metadata().hasDisconnect(),
-                    ctx.channel().config(), new SnappyFrameDecoder());
+                    ctx.channel().config(), new SnappyFrameDecoder(),
+                    new HttpDecompressionAllocationGuard(maxAllocation));
         }
 
         if (Zstd.isAvailable() && ZSTD.contentEqualsIgnoreCase(contentEncoding)) {
             return new EmbeddedChannel(ctx.channel().id(), ctx.channel().metadata().hasDisconnect(),
-                    ctx.channel().config(), new ZstdDecoder());
+                    ctx.channel().config(), new ZstdDecoder(),
+                    new HttpDecompressionAllocationGuard(maxAllocation));
         }
 
         // 'identity' or unsupported
